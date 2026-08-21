@@ -331,7 +331,7 @@ async function captureAndRecognize(){
   if (!video.videoWidth) return null;
 
   // Downscale to a width that's fast to process but still legible.
-  const targetWidth = 1000;
+  const targetWidth = 1280;
   const scale = Math.min(1, targetWidth / video.videoWidth);
   const w = Math.round(video.videoWidth * scale);
   const h = Math.round(video.videoHeight * scale);
