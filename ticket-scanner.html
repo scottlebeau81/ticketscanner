@@ -284,6 +284,7 @@ async function startScanning(){
     });
     video.srcObject = mediaStream;
     await video.play();
+    applyZoomIfSupported(mediaStream);
   } catch(err){
     showCameraError(err);
     return;
@@ -293,6 +294,20 @@ async function startScanning(){
   scanning = true;
   statusText.textContent = 'Scanning…';
   runLoop();
+}
+
+// ---- ask the camera to zoom in a bit, if the phone/browser allows it ----
+// (Not all devices expose this — if it's not supported, this quietly
+// does nothing and the app just runs at normal 1x.)
+async function applyZoomIfSupported(stream){
+  try{
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : null;
+    if (caps && caps.zoom){
+      const desired = Math.min(caps.zoom.max, Math.max(caps.zoom.min, 2));
+      await track.applyConstraints({ advanced: [{ zoom: desired }] });
+    }
+  } catch(e){ /* zoom not supported here — that's fine, just skip it */ }
 }
 
 function showCameraError(err){
@@ -326,22 +341,38 @@ async function runLoop(){
 
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-// ---- grab one frame, clean it up, run OCR, look for the target ----
-async function captureAndRecognize(){
-  if (!video.videoWidth) return null;
+// An offscreen canvas we capture each raw frame into before testing it
+// at different rotations. Never shown on screen directly.
+const captureCanvas = document.createElement('canvas');
+const captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
 
-  // Downscale to a width that's fast to process but still legible.
-  const targetWidth = 1280;
-  const scale = Math.min(1, targetWidth / video.videoWidth);
-  const w = Math.round(video.videoWidth * scale);
-  const h = Math.round(video.videoHeight * scale);
-  frameCanvas.width = w;
-  frameCanvas.height = h;
-  ctx.drawImage(video, 0, 0, w, h);
+// Labels don't always sit upright on the box — a case can end up sideways
+// or flipped on a shelf. Tesseract only reads text that's roughly the
+// right way up, so we test each frame at all four compass rotations.
+// This costs up to 4x the OCR time per frame (slower scanning), but it's
+// the only reliable way to catch a rotated or upside-down label.
+const ROTATIONS = [0, 90, 180, 270];
 
+function rotatedCopy(sourceCanvas, angleDeg){
+  if (angleDeg === 0) return sourceCanvas;
+  const sw = sourceCanvas.width, sh = sourceCanvas.height;
+  const out = document.createElement('canvas');
+  const swapped = (angleDeg === 90 || angleDeg === 270);
+  out.width  = swapped ? sh : sw;
+  out.height = swapped ? sw : sh;
+  const octx = out.getContext('2d');
+  octx.save();
+  octx.translate(out.width / 2, out.height / 2);
+  octx.rotate(angleDeg * Math.PI / 180);
+  octx.drawImage(sourceCanvas, -sw / 2, -sh / 2);
+  octx.restore();
+  return out;
+}
+
+function applyGrayContrast(ctx2d, w, h){
   // Grayscale + contrast boost — printed labels read much more
   // reliably once the background/foreground contrast is stretched.
-  const imgData = ctx.getImageData(0, 0, w, h);
+  const imgData = ctx2d.getImageData(0, 0, w, h);
   const d = imgData.data;
   const contrast = 1.4;
   for (let i = 0; i < d.length; i += 4){
@@ -350,23 +381,44 @@ async function captureAndRecognize(){
     v = v < 0 ? 0 : (v > 255 ? 255 : v);
     d[i] = d[i + 1] = d[i + 2] = v;
   }
-  ctx.putImageData(imgData, 0, 0);
+  ctx2d.putImageData(imgData, 0, 0);
+}
 
-  const { data } = await ocrWorker.recognize(frameCanvas);
-
+function findMatchInData(data){
   // First look for a single word that's an exact match — most precise.
   for (const word of (data.words || [])){
     const cleaned = word.text.replace(/[^0-9]/g, '');
-    if (cleaned && cleaned === target){
-      return { bbox: word.bbox };
-    }
+    if (cleaned && cleaned === target) return { bbox: word.bbox };
   }
   // Fall back to a whole recognized line containing the number, in case
   // OCR split the digits into separate tokens with a stray gap.
   for (const line of (data.lines || [])){
     const cleaned = line.text.replace(/[^0-9]/g, '');
-    if (cleaned && cleaned.includes(target)){
-      return { bbox: line.bbox };
+    if (cleaned && cleaned.includes(target)) return { bbox: line.bbox };
+  }
+  return null;
+}
+
+// ---- grab one frame, clean it up, run OCR at every rotation ----
+async function captureAndRecognize(){
+  if (!video.videoWidth) return null;
+
+  // Downscale to a width that's fast to process but still legible.
+  const targetWidth = 1280;
+  const scale = Math.min(1, targetWidth / video.videoWidth);
+  const w = Math.round(video.videoWidth * scale);
+  const h = Math.round(video.videoHeight * scale);
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+  captureCtx.drawImage(video, 0, 0, w, h);
+  applyGrayContrast(captureCtx, w, h);
+
+  for (const angle of ROTATIONS){
+    const testCanvas = rotatedCopy(captureCanvas, angle);
+    const { data } = await ocrWorker.recognize(testCanvas);
+    const found = findMatchInData(data);
+    if (found){
+      return { canvas: testCanvas, bbox: found.bbox };
     }
   }
   return null;
@@ -379,15 +431,24 @@ function handleMatch(match){
   if (navigator.vibrate) navigator.vibrate([180, 90, 180]);
   beep();
 
-  // Draw a highlight box around the match, with a little padding.
+  // Draw a highlight box directly on the canvas that matched (whichever
+  // rotation that was) — so the screenshot always shows the number
+  // right-side-up, even if the label itself was sideways or flipped.
+  const src = match.canvas;
+  const sctx = src.getContext('2d');
   const { x0, y0, x1, y1 } = match.bbox;
   const pad = Math.max(6, (x1 - x0) * 0.15);
-  ctx.lineWidth = Math.max(3, frameCanvas.width * 0.006);
-  ctx.strokeStyle = '#35D07F';
-  ctx.shadowColor = 'rgba(53,208,127,.9)';
-  ctx.shadowBlur = 10;
-  ctx.strokeRect(x0 - pad, y0 - pad, (x1 - x0) + pad * 2, (y1 - y0) + pad * 2);
-  ctx.shadowBlur = 0;
+  sctx.lineWidth = Math.max(3, src.width * 0.006);
+  sctx.strokeStyle = '#35D07F';
+  sctx.shadowColor = 'rgba(53,208,127,.9)';
+  sctx.shadowBlur = 10;
+  sctx.strokeRect(x0 - pad, y0 - pad, (x1 - x0) + pad * 2, (y1 - y0) + pad * 2);
+  sctx.shadowBlur = 0;
+
+  // Copy the (now highlighted) canvas onto the visible result canvas.
+  frameCanvas.width = src.width;
+  frameCanvas.height = src.height;
+  ctx.drawImage(src, 0, 0);
 
   foundNum.textContent = '#' + target;
   showScreen(resultScreen);
