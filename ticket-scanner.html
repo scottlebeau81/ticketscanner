@@ -86,6 +86,15 @@
   @keyframes sweep{
     0%{ top:2%; opacity:0; } 10%{ opacity:1; } 90%{ opacity:1; } 100%{ top:96%; opacity:0; }
   }
+  .reticle .prop{
+    position:absolute; top:-16px; width:32px; height:32px;
+    transform-origin:50% 50%; animation:propSpin 3.2s linear infinite;
+    filter:drop-shadow(0 0 4px rgba(255,176,32,.55));
+  }
+  .reticle .prop.left{ left:-16px; }
+  .reticle .prop.right{ right:-16px; }
+  .reticle.processing .prop{ animation-duration:.35s; }
+  @keyframes propSpin{ from{ transform:rotate(0deg); } to{ transform:rotate(360deg); } }
   #scan-bottom{
     position:absolute; left:0; right:0; bottom:0; z-index:5; display:flex;
     flex-direction:column; align-items:center; gap:8px;
@@ -157,7 +166,11 @@
   <!-- ============ SCREEN 2: live camera + OCR loop ============ -->
   <div id="scan-screen" class="hidden">
     <video id="video" autoplay playsinline muted></video>
-    <div class="reticle" id="reticle"><div class="scanline"></div></div>
+    <div class="reticle" id="reticle">
+      <div class="scanline"></div>
+      <svg class="prop left" viewBox="0 0 40 40"><circle cx="20" cy="20" r="3" fill="var(--amber)"/><ellipse cx="20" cy="20" rx="17" ry="3" fill="var(--amber)" opacity=".85"/><ellipse cx="20" cy="20" rx="3" ry="17" fill="var(--amber)" opacity=".85"/></svg>
+      <svg class="prop right" viewBox="0 0 40 40"><circle cx="20" cy="20" r="3" fill="var(--amber)"/><ellipse cx="20" cy="20" rx="17" ry="3" fill="var(--amber)" opacity=".85"/><ellipse cx="20" cy="20" rx="3" ry="17" fill="var(--amber)" opacity=".85"/></svg>
+    </div>
     <div id="scan-top">
       <div id="scan-target">Looking for <b id="scan-target-num"></b></div>
       <button id="stop-btn">Cancel</button>
@@ -257,10 +270,12 @@ async function ensureWorker(){
   loadingText.textContent = 'Loading text recognizer…';
   loadingOverlay.classList.remove('hidden');
   ocrWorker = await Tesseract.createWorker('eng');
-  // Numbers only, and treat the image as scattered text rather than
-  // one neat paragraph — labels on boxes aren't laid out like a page.
+  // Digits plus '#' — your tickets are always printed as "#12345", so
+  // letting Tesseract recognize the '#' as itself (rather than forcing
+  // it to misread that shape as a stray digit) keeps the number itself
+  // cleaner. We still strip the '#' back out before comparing.
   await ocrWorker.setParameters({
-    tessedit_char_whitelist: '0123456789',
+    tessedit_char_whitelist: '#0123456789',
     tessedit_pageseg_mode: '11'
   });
   loadingOverlay.classList.add('hidden');
@@ -298,13 +313,14 @@ async function startScanning(){
 
 // ---- ask the camera to zoom in a bit, if the phone/browser allows it ----
 // (Not all devices expose this — if it's not supported, this quietly
-// does nothing and the app just runs at normal 1x.)
+// does nothing and the app just runs at normal 1x.) Bumped from 2x to
+// 2.5x since real scanning distance is a few feet, not close-up.
 async function applyZoomIfSupported(stream){
   try{
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : null;
     if (caps && caps.zoom){
-      const desired = Math.min(caps.zoom.max, Math.max(caps.zoom.min, 2));
+      const desired = Math.min(caps.zoom.max, Math.max(caps.zoom.min, 2.5));
       await track.applyConstraints({ advanced: [{ zoom: desired }] });
     }
   } catch(e){ /* zoom not supported here — that's fine, just skip it */ }
@@ -335,7 +351,7 @@ async function runLoop(){
       return; // pause the loop — "Keep Scanning" starts it again
     }
     // brief pause before the next capture so we don't hammer the CPU
-    await sleep(250);
+    await sleep(120);
   }
 }
 
@@ -346,12 +362,12 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 const captureCanvas = document.createElement('canvas');
 const captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
 
-// Labels don't always sit upright on the box — a case can end up sideways
-// or flipped on a shelf. Tesseract only reads text that's roughly the
-// right way up, so we test each frame at all four compass rotations.
-// This costs up to 4x the OCR time per frame (slower scanning), but it's
-// the only reliable way to catch a rotated or upside-down label.
-const ROTATIONS = [0, 90, 180, 270];
+// Labels don't always sit upright on the box, and checking every
+// rotation catches that — but it costs up to 4x the OCR time per frame.
+// For a fast walking scan we default to just upright (0°). If your real
+// bin labels turn out to often be sideways or flipped, change this back
+// to [0, 90, 180, 270] and we trade speed for that extra coverage.
+const ROTATIONS = [0];
 
 function rotatedCopy(sourceCanvas, angleDeg){
   if (angleDeg === 0) return sourceCanvas;
@@ -372,9 +388,12 @@ function rotatedCopy(sourceCanvas, angleDeg){
 function applyGrayContrast(ctx2d, w, h){
   // Grayscale + contrast boost — printed labels read much more
   // reliably once the background/foreground contrast is stretched.
+  // Your real tickets are black text on a light laminated background —
+  // genuinely high native contrast — so we can push this a bit harder
+  // than a generic "unknown lighting" default.
   const imgData = ctx2d.getImageData(0, 0, w, h);
   const d = imgData.data;
-  const contrast = 1.4;
+  const contrast = 1.6;
   for (let i = 0; i < d.length; i += 4){
     const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
     let v = (gray - 128) * contrast + 128;
@@ -384,9 +403,41 @@ function applyGrayContrast(ctx2d, w, h){
   ctx2d.putImageData(imgData, 0, 0);
 }
 
+// Is there a word containing '#' sitting immediately to the left of this
+// digit word, on the same line? Tesseract sometimes reads the '#' and
+// the digits as two separate tokens rather than one fused "#12345".
+function hasAdjacentHash(words, digitWord){
+  const lineHeight = digitWord.bbox.y1 - digitWord.bbox.y0;
+  for (const w of words){
+    if (w === digitWord || !w.text.includes('#')) continue;
+    const sameLine = Math.abs(w.bbox.y0 - digitWord.bbox.y0) < lineHeight * 0.6;
+    const justToTheLeft = w.bbox.x1 <= digitWord.bbox.x0 + lineHeight * 0.5 &&
+                           w.bbox.x1 >= digitWord.bbox.x0 - lineHeight * 3;
+    if (sameLine && justToTheLeft) return true;
+  }
+  return false;
+}
+
 function findMatchInData(data){
-  // First look for a single word that's an exact match — most precise.
-  for (const word of (data.words || [])){
+  const words = data.words || [];
+
+  // Highest confidence: a word shaped exactly like your real tickets —
+  // "#" immediately followed by the target digits, nothing else. That's
+  // precisely how these labels are printed, so a hit in this exact shape
+  // is very unlikely to be a coincidence (a phone number or zip code
+  // elsewhere on the label, for instance).
+  for (const word of words){
+    if (word.text.replace(/\s+/g, '') === ('#' + target)) return { bbox: word.bbox };
+  }
+  // Next best: the digits with a separate '#' token confirmed just to
+  // the left of them.
+  for (const word of words){
+    const cleaned = word.text.replace(/[^0-9]/g, '');
+    if (cleaned === target && hasAdjacentHash(words, word)) return { bbox: word.bbox };
+  }
+  // Still good: just the digits themselves, no confirmed '#' — OCR
+  // sometimes drops the symbol (glare off the laminated label).
+  for (const word of words){
     const cleaned = word.text.replace(/[^0-9]/g, '');
     if (cleaned && cleaned === target) return { bbox: word.bbox };
   }
@@ -399,26 +450,156 @@ function findMatchInData(data){
   return null;
 }
 
-// ---- grab one frame, clean it up, run OCR at every rotation ----
+// Grow the matched number's box to cover the rest of the ticket, not
+// just the digits — folding in any other detected text that belongs to
+// the same label. With labels packed tightly side by side and stacked
+// on real shelves, we deliberately keep this narrow and DOWNWARD ONLY —
+// your own description of the layout (number, then logo, then details,
+// always stacked in a single column below the number) means there's
+// never a reason to reach sideways or upward, which is exactly where a
+// neighboring ticket would be sitting.
+function expandToWholeTicket(words, matchBbox){
+  let { x0, y0, x1, y1 } = matchBbox;
+  const lineHeight = y1 - y0;
+  const vReachBelow = lineHeight * 2.5; // how far below counts as "part of this ticket"
+  const hSlack = (x1 - x0) * 0.6;       // a little horizontal give for centered text
+
+  for (const w of words){
+    const b = w.bbox;
+    const isBelow = b.y0 >= y0 - lineHeight * 0.3 && b.y0 <= y1 + vReachBelow;
+    const inColumn = b.x0 < x1 + hSlack && b.x1 > x0 - hSlack;
+    if (isBelow && inColumn){
+      x0 = Math.min(x0, b.x0);
+      y0 = Math.min(y0, b.y0);
+      x1 = Math.max(x1, b.x1);
+      y1 = Math.max(y1, b.y1);
+    }
+  }
+  return { x0, y0, x1, y1 };
+}
+
+// A crude but useful proxy for "is the logo sitting here" — Tesseract
+// only reads text, it can't recognize a logo image, so instead we check
+// whether the region just below the matched number has real printed
+// content (high pixel contrast) rather than blank background. If the
+// scan band cut off before we could see below the number at all, we
+// don't penalize the match for that — we just can't confirm either way.
+function hasContentBelow(canvas, matchBbox){
+  const w = canvas.width, h = canvas.height;
+  const lineHeight = matchBbox.y1 - matchBbox.y0;
+  const checkY0 = Math.round(matchBbox.y1 + lineHeight * 0.15);
+  const checkY1 = Math.min(h, Math.round(matchBbox.y1 + lineHeight * 3));
+  const checkX0 = Math.max(0, Math.round(matchBbox.x0));
+  const checkX1 = Math.min(w, Math.round(matchBbox.x1));
+  if (checkY0 >= h || checkY1 - checkY0 < 4 || checkX1 - checkX0 < 4) return true;
+
+  const ctx2d = canvas.getContext('2d');
+  const region = ctx2d.getImageData(checkX0, checkY0, checkX1 - checkX0, checkY1 - checkY0);
+  const d = region.data;
+  const n = d.length / 4;
+  let sum = 0, sumSq = 0;
+  for (let i = 0; i < d.length; i += 4){
+    sum += d[i];
+    sumSq += d[i] * d[i];
+  }
+  const mean = sum / n;
+  const variance = Math.max(0, (sumSq / n) - (mean * mean));
+  // Blank background is fairly uniform (low contrast variation);
+  // printed content — the logo, address block, etc. — isn't.
+  return Math.sqrt(variance) > 18;
+}
+
+// The reticle on screen isn't just decoration — this is the exact same
+// band (8% margin left/right, middle 24% of the height) that actually
+// gets read. Keep the row of labels running through that box as you
+// walk. Reading only this band instead of the full photo is the single
+// biggest speed win, since there's far less image for Tesseract to search.
+const SCAN_BAND = { leftPct: 0.08, rightPct: 0.08, topPct: 0.38, bottomPct: 0.38 };
+
+// ---- barcode reading (fast path, tried before OCR) ----
+// Chrome on Android has a built-in barcode/QR reader — no extra library
+// needed. Not every device supports it, and today's labels don't have a
+// barcode at all, so this quietly falls through to OCR when unavailable
+// or when nothing's found. Ready to go the moment a labels does have one.
+let barcodeDetector; // undefined = not checked yet, null = unsupported here
+async function ensureBarcodeDetector(){
+  if (barcodeDetector !== undefined) return barcodeDetector;
+  if (!('BarcodeDetector' in window)){
+    barcodeDetector = null;
+    return barcodeDetector;
+  }
+  try{
+    const supported = await BarcodeDetector.getSupportedFormats();
+    barcodeDetector = new BarcodeDetector({ formats: supported });
+  } catch(e){
+    barcodeDetector = null;
+  }
+  return barcodeDetector;
+}
+
+// We don't yet know exactly what a real barcode will encode (the bare
+// ticket number, a full URL containing it, something else) — so this
+// checks a few reasonable shapes rather than requiring an exact match.
+function barcodeMatchesTarget(rawValue){
+  if (!rawValue) return false;
+  if (rawValue === target) return true;
+  if (rawValue.replace(/[^0-9]/g, '') === target) return true;
+  return rawValue.includes(target);
+}
+
+async function tryBarcodeMatch(canvas){
+  const detector = await ensureBarcodeDetector();
+  if (!detector) return null;
+  try{
+    const barcodes = await detector.detect(canvas);
+    for (const bc of barcodes){
+      if (barcodeMatchesTarget(bc.rawValue)){
+        const r = bc.boundingBox;
+        return { canvas, bbox: { x0: r.x, y0: r.y, x1: r.x + r.width, y1: r.y + r.height } };
+      }
+    }
+  } catch(e){ /* detector hiccup this frame — just fall through to OCR */ }
+  return null;
+}
+
+// ---- grab the reticle band, try the barcode reader, then fall back to OCR ----
 async function captureAndRecognize(){
   if (!video.videoWidth) return null;
 
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cropX = Math.round(vw * SCAN_BAND.leftPct);
+  const cropW = Math.round(vw * (1 - SCAN_BAND.leftPct - SCAN_BAND.rightPct));
+  const cropY = Math.round(vh * SCAN_BAND.topPct);
+  const cropH = Math.round(vh * (1 - SCAN_BAND.topPct - SCAN_BAND.bottomPct));
+
   // Downscale to a width that's fast to process but still legible.
-  const targetWidth = 1280;
-  const scale = Math.min(1, targetWidth / video.videoWidth);
-  const w = Math.round(video.videoWidth * scale);
-  const h = Math.round(video.videoHeight * scale);
+  // Bumped back up for better accuracy on real labels at shelf distance —
+  // this trades a bit of the walking-speed we tuned for last round.
+  const targetWidth = 1100;
+  const scale = Math.min(1, targetWidth / cropW);
+  const w = Math.round(cropW * scale);
+  const h = Math.round(cropH * scale);
   captureCanvas.width = w;
   captureCanvas.height = h;
-  captureCtx.drawImage(video, 0, 0, w, h);
+  captureCtx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, w, h);
+
+  // Try the barcode reader first, on the raw (still full-color) frame —
+  // it's much faster and far more reliable than OCR whenever a label
+  // actually has one.
+  const barcodeMatch = await tryBarcodeMatch(captureCanvas);
+  if (barcodeMatch) return barcodeMatch;
+
+  // No barcode found on this label (or the device doesn't support
+  // reading one) — fall back to reading the printed number, same as before.
   applyGrayContrast(captureCtx, w, h);
 
   for (const angle of ROTATIONS){
     const testCanvas = rotatedCopy(captureCanvas, angle);
     const { data } = await ocrWorker.recognize(testCanvas);
     const found = findMatchInData(data);
-    if (found){
-      return { canvas: testCanvas, bbox: found.bbox };
+    if (found && hasContentBelow(testCanvas, found.bbox)){
+      const ticketBox = expandToWholeTicket(data.words || [], found.bbox);
+      return { canvas: testCanvas, bbox: ticketBox };
     }
   }
   return null;
