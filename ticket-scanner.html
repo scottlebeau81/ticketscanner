@@ -149,10 +149,16 @@
   }
   @keyframes spin{ to{ transform:rotate(360deg); } }
   #loading-overlay p{ color:var(--text-dim); font-size:13px; }
+  #version-tag{
+    position:fixed; bottom:6px; right:9px; z-index:50;
+    font-family:var(--mono); font-size:10px; color:rgba(255,255,255,.4);
+    pointer-events:none; letter-spacing:.03em;
+  }
 </style>
 </head>
 <body>
 <div id="app">
+<div id="version-tag">v2026-09-12-a</div>
 
   <!-- ============ SCREEN 1: enter the ticket number ============ -->
   <div id="setup-screen">
