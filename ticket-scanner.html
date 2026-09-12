@@ -74,7 +74,7 @@
     padding:9px 16px; border-radius:20px; font-size:13px; font-weight:600;
   }
   .reticle{
-    position:absolute; left:8%; right:8%; top:38%; bottom:38%; z-index:4;
+    position:absolute; left:8%; right:8%; top:30%; bottom:30%; z-index:4;
     border:2px solid rgba(255,176,32,.55); border-radius:14px; pointer-events:none;
   }
   .reticle .scanline{
@@ -478,49 +478,24 @@ function expandToWholeTicket(words, matchBbox){
   return { x0, y0, x1, y1 };
 }
 
-// A crude but useful proxy for "is the logo sitting here" — Tesseract
-// only reads text, it can't recognize a logo image, so instead we check
-// whether the region just below the matched number has real printed
-// content (high pixel contrast) rather than blank background. If the
-// scan band cut off before we could see below the number at all, we
-// don't penalize the match for that — we just can't confirm either way.
-function hasContentBelow(canvas, matchBbox){
-  const w = canvas.width, h = canvas.height;
-  const lineHeight = matchBbox.y1 - matchBbox.y0;
-  const checkY0 = Math.round(matchBbox.y1 + lineHeight * 0.15);
-  const checkY1 = Math.min(h, Math.round(matchBbox.y1 + lineHeight * 3));
-  const checkX0 = Math.max(0, Math.round(matchBbox.x0));
-  const checkX1 = Math.min(w, Math.round(matchBbox.x1));
-  if (checkY0 >= h || checkY1 - checkY0 < 4 || checkX1 - checkX0 < 4) return true;
-
-  const ctx2d = canvas.getContext('2d');
-  const region = ctx2d.getImageData(checkX0, checkY0, checkX1 - checkX0, checkY1 - checkY0);
-  const d = region.data;
-  const n = d.length / 4;
-  let sum = 0, sumSq = 0;
-  for (let i = 0; i < d.length; i += 4){
-    sum += d[i];
-    sumSq += d[i] * d[i];
-  }
-  const mean = sum / n;
-  const variance = Math.max(0, (sumSq / n) - (mean * mean));
-  // Blank background is fairly uniform (low contrast variation);
-  // printed content — the logo, address block, etc. — isn't.
-  return Math.sqrt(variance) > 18;
-}
 
 // The reticle on screen isn't just decoration — this is the exact same
-// band (8% margin left/right, middle 24% of the height) that actually
-// gets read. Keep the row of labels running through that box as you
-// walk. Reading only this band instead of the full photo is the single
-// biggest speed win, since there's far less image for Tesseract to search.
-const SCAN_BAND = { leftPct: 0.08, rightPct: 0.08, topPct: 0.38, bottomPct: 0.38 };
+// band that actually gets read. Keep the row of labels running through
+// that box as you walk. Widened from a tight quarter-height band to
+// roughly 40% of the frame height — more forgiving to aim now that
+// misses (not speed) are the priority, and boxes are confirmed upright
+// so we don't need extra margin for rotation safety.
+const SCAN_BAND = { leftPct: 0.08, rightPct: 0.08, topPct: 0.30, bottomPct: 0.30 };
 
 // ---- barcode reading (fast path, tried before OCR) ----
+// Off for now: there are no real barcodes yet, so this ran every single
+// frame for guaranteed zero payoff — pure wasted time. Flip this to
+// true the moment there's a real barcode label to test against.
+const ENABLE_BARCODE = false;
+
 // Chrome on Android has a built-in barcode/QR reader — no extra library
-// needed. Not every device supports it, and today's labels don't have a
-// barcode at all, so this quietly falls through to OCR when unavailable
-// or when nothing's found. Ready to go the moment a labels does have one.
+// needed. Not every device supports it, so this quietly falls through
+// to OCR when unavailable or when nothing's found.
 let barcodeDetector; // undefined = not checked yet, null = unsupported here
 async function ensureBarcodeDetector(){
   if (barcodeDetector !== undefined) return barcodeDetector;
@@ -548,6 +523,7 @@ function barcodeMatchesTarget(rawValue){
 }
 
 async function tryBarcodeMatch(canvas){
+  if (!ENABLE_BARCODE) return null;
   const detector = await ensureBarcodeDetector();
   if (!detector) return null;
   try{
@@ -597,7 +573,7 @@ async function captureAndRecognize(){
     const testCanvas = rotatedCopy(captureCanvas, angle);
     const { data } = await ocrWorker.recognize(testCanvas);
     const found = findMatchInData(data);
-    if (found && hasContentBelow(testCanvas, found.bbox)){
+    if (found){
       const ticketBox = expandToWholeTicket(data.words || [], found.bbox);
       return { canvas: testCanvas, bbox: ticketBox };
     }
